@@ -1,0 +1,40 @@
+Pintos booting with 4,096 kB RAM...
+Kernel command line: -f -q put exec-once put child-simple run exec-once
+372 pages available in kernel pool.
+371 pages available in user pool.
+Calibrating timer...  102,400 loops/s.
+hd0:0: detected 1,008 sector (504 kB) disk, model "Generic 1234", serial ""
+hd0:1: detected 4,032 sector (1 MB) disk, model "Generic 1234", serial ""
+hd1:0: detected 1,008 sector (504 kB) disk, model "Generic 1234", serial ""
+Formatting filesystem...done.
+Boot complete.
+Putting 'exec-once' into the file system...
+Putting 'child-simple' into the file system...
+Executing 'exec-once':
+(exec-once) begin
+(child-simple) run
+child-simple: exit(81)
+(exec-once) end
+exec-once: exit(0)
+Execution of 'exec-once' complete.
+Timer: 6762 ticks
+Thread: 30 idle ticks, 5321 kernel ticks, 1414 user ticks
+hd0:0: 0 reads, 0 writes
+hd0:1: 75 reads, 239 writes
+hd1:0: 234 reads, 0 writes
+
+--------------------------------
+         Cache Statistics         
+--------------------------------
+Num Misses: 75
+Num evictions: 222
+
+--------------------------------
+Console: 1058 characters output
+Keyboard: 0 keys pressed
+Exception: 0 page faults
+Powering off...
+Copying tests/userprog/exec-once into /tmp/SFD0FJsfx3.dsk...
+Copying tests/userprog/child-simple into /tmp/SFD0FJsfx3.dsk...
+Writing command line to /tmp/G8jfLrtfQI.dsk...
+bochs -q

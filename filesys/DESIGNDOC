@@ -1,0 +1,494 @@
+             +-------------------------+
+             |        CS 140           |
+             | PROJECT 4: FILE SYSTEMS |
+             |     DESIGN DOCUMENT     |
+             +-------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Dan Holbert <dholbert@stanford.edu>
+Tom Deane <tdeane@stanford.edu>
+Tim Su <timsu@stanford.edu>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+We implemented "." and ".." directory listings. We represent these as actual
+directory entries, with their own dir_entry structs whose "inode_sector" entry
+points to the appropriate sector.  These entries are automatically added
+to each newly created directory in the dir_create function.
+
+As in UNIX, the root directory's ".." entry will take you back to the root
+directory.
+
+To make this work, we modified our dir_create interface slightly so that for
+any newly created directory, we can automatically find the parent directory's
+sector number and use that to add ".." to the new directory.  To achieve this,
+we replaced "dir_create" with two functions: "dir_create_with_parent_sector"
+and a wrapper called "dir_create_with_parent_dir". We use these in different
+places, depending on whether the caller has the parent directory's dir* or its
+sector number. In particular, do_format() in filesys.c has the sector number
+of the root directory, but does not have a directory entry for it yet, so it
+calls the dir_create_with_parent_sector() version.  On the other hand,
+syscall.c's "mkdir()" has a dir* for the parent directory, so it uses the
+dir_create_with_parent_dir() version.
+
+
+Notes about our version of the file system:
+
+- our freemap is in memory, and only is written to disk at the end. if
+crash recovery were an issue, we could create a worker thread to periodically
+write the freemap back to disk.
+
+- we have protection for inodes: we have an extra protection bit so if
+we try to open an inode we deleted (somehow), the bit will be checked and if
+this inode sector isn't in use, the open will fail. Whenever we close an
+inode we clear this bit on disk.
+
+- we have optimizations for small files: in our inode we store around
+400 bytes of the file, so if a file is smaller than this, it will only
+require one sector on disk.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, and lecture notes.
+
+             INDEXED AND EXTENSIBLE FILES
+             ============================
+
+---- DATA STRUCTURES ----
+
+>> Copy here the declaration of each new or changed `struct' or `struct'
+>> member, global or static variable, `typedef', or enumeration.
+>> Identify the purpose of each in 25 words or less.
+
+Here is our in-memory inode structure. We store the size because we use
+it on every file read, and it's only 4 bytes.
+
+    /* In-memory inode. */
+    struct inode 
+      { 
+        struct list_elem elem;              /* Element in inode list. */
+        disk_sector_t sector;               /* Sector number of disk 
+                                                    location. */
+        int open_cnt;                       /* Number of openers. */
+        bool removed;                       /* True if deleted, false 
+                                                    otherwise. */
+        int deny_write_cnt;                 /* 0: writes ok, >0: deny 
+                                                    writes. */
+        struct lock inode_lock;             /* lock for locking writes to
+                                                    inode metadata */
+      };
+  
+Here are our on-disk data structures. There's the indirect block, the data, 
+and the inode_disk.
+
+    /* On-disk indirect (or double-indirect block)
+       Must be exactly DISK_SECTOR_SIZE bytes long. */
+    struct indirect_block_disk
+    {
+      disk_sector_t sectors[INDIRECT_BLOCKS_PER_SECTOR];
+    };
+    
+    /* On-disk data block
+       Must be exactly DISK_SECTOR_SIZE bytes long. */
+    struct data_block_disk
+    {
+      unsigned char data[DATA_BLOCK_DATA_COUNT];
+    };
+    
+    /* On-disk inode.
+       Must be exactly DISK_SECTOR_SIZE bytes long. */
+    struct inode_disk
+      {
+        unsigned char status_bits;             /* bit 0 - used/unused.
+                                                  bit 1 - is_directory 
+                                                  bit 2-7 - unused */
+        unsigned char data[INODE_DATA_COUNT];  /* file data - esp. for
+                                                      small files */
+
+        off_t file_size;                       /* file size */
+        unsigned int magic;                    /* Magic number */
+    
+        /* links to data */
+        disk_sector_t direct_links[DIRECT_LINKS];
+        disk_sector_t indirect_links[INDIRECT_LINKS];
+        disk_sector_t double_i_link;
+      };
+  
+This lock protects our open_inodes list when we read/write to it.
+
+    static struct lock open_inodes_lock;
+
+>> What is the maximum size of a file supported by your inode structure?
+
+Our inode structure supports a maximum file size of 8.19 MB.
+Here's a breakdown of where that data is stored:
+ - In the inode_disk's "data" field: 438 bytes
+ - 12 direct links:  12*512 = 6144 bytes.  
+ - 3 indirect links: 3*128*512 = 196608 bytes
+ - 1 doubly-indirect link: 1*128*128*512 = 8388608 bytes
+
+Total: 8591798 bytes = 8.19 mb.
+
+If we needed to, we could easily extend this with a triple-indirect
+link. Our byte-to-sector code is already ready for nth-indirect blocks
+(it runs recursively), so adding it would be easy. With this, we would be
+able to get 1 GB files.
+
+
+---- SYNCHRONIZATION ----
+
+>> Explain how your code avoids a race if two processes attempt to extend
+>> a file at the same time.
+
+We have one big file system lock. Just kidding.
+
+Since we are using sparse file growth, "extending a file" only means
+updating the inode's file size - there isn't any other metadata that
+we have to update.  Each inode in memory has its own lock, and whenever
+we read/write the metadata (reading/writing the file size, or the inode's
+links, etc), we lock. Specifically, you can see in "increase_file_size"
+in inode.c where we acquire the lock, update the metadata, and release.
+
+The other race condition will be because of our sparse growth: what if
+two processes want to create an indirect block or something at the same
+time? We use the same inode metadata lock for this case too: when we are
+calling byte_to_sector, we lock the entire function. The reason we lock
+the entire function is because everything that function does will be
+reading or writing metadata.
+
+>> Suppose processes A and B both have file F open, both positioned at
+>> end-of-file.  If A reads and B writes F at the same time, A may read
+>> all, part, or none of what B writes.  However, A may not read data
+>> other than what B writes, e.g. if B writes nonzero data, A is not
+>> allowed to see all zeros.  Explain how your code avoids this race.
+
+This race would occur if we grew the file all at once, and then wrote
+each block one-by-one. Since the file is larger than what we have
+written, and we use a sparse growth system, we could potentially
+read near the end of the file, think it's a sparse area, and read 0's.
+
+Therefore, we extend the file size right after we write a block. That
+way if a read occurs before we extend, the read will not be able
+to read anything because although we've written data to this new sector,
+we haven't updated the file size. If we read after we write the block,
+we should be able to read the whole block. If we try to read while
+extending, we have locks protecting the inode metadata so there can
+be no interleaving.
+
+>> Explain how your synchronization design provides "fairness".  File
+>> access is "fair" if readers cannot indefinitely block writers or vice
+>> versa.  That is, many processes reading from a file cannot prevent
+>> forever another process from writing the file, and many processes
+>> writing to a file cannot prevent another process forever from reading
+>> the file.
+
+We are not synchronizing disk reads or writes, only while calling
+byte_to_sector. We are thus only locking for a small portion of the
+read/write process. We have to synchronize that section, or else
+we could be reading metadata that is in an inconsistent state (which
+would be very bad).
+
+Disk reading/writing is done in cache.c, and operates on memory. We
+have no locks when we issue the actual memcpy command, so reads and
+writes can be simultaneous to the same location in memory. Also, our
+design thus doesn't bias readers or writers: we treat both as the same
+and our code is similar for both, except for the case when we are
+extending a file.
+
+---- RATIONALE ----
+
+>> Is your inode structure a multilevel index?  If so, why did you choose
+>> this particular combination of direct, indirect, and doubly indirect
+>> blocks?  If not, why did you choose an alternative inode structure,
+>> and what advantages and disadvantages does your structure have,
+>> compared to a multilevel index?
+
+Our inode structure is a multilevel index with 12 direct blocks, 3
+indirect blocks, and one double-indirect block. The reason we chose
+this structure is that we decided to optimize performance and
+efficiency for small files. Therefore, we are storing 400-ish bytes
+of data in the inode itself. As we tried to maximize the # of bytes
+we could store in the inode itself, we tried to minimize the #
+of links we had. We felt it was necessary to get good performance
+with files of all size, and so we have a multilevel index.
+
+We have direct blocks so medim-small files, like the freemap can
+perform well without too many lookups. We have indirect blocks so
+medium-sized files, like executables, perform decently with only
+one extra lookup. Finally, we use the double-indirect block to
+support larger files. Since we tried to maintain a continuum of
+performance, where small files have few lookups and large files
+have more lookups, we decided to use the multilevel index.
+
+We chose 12/3/1 specifically because this scheme was mentioned as
+the one UFS used in the textbook. The exact numbers probably will
+only matter for files that are exactly on those boundaries (for
+example, a file that is exactly 13 blocks won't work well with
+12 direct blocks in the file), but this is not a very common case.
+
+If we had more data, we could analyze the most common file sizes used
+by our users. We could then design our system around those file sizes,
+so those would fall into the more performant category.
+
+                SUBDIRECTORIES
+                ==============
+
+---- DATA STRUCTURES ----
+
+>> Copy here the declaration of each new or changed `struct' or `struct'
+>> member, global or static variable, `typedef', or enumeration.
+>> Identify the purpose of each in 25 words or less.
+
+We didn't add any of these for the subdirectory code.
+
+---- ALGORITHMS ----
+
+>> Describe your code for traversing a user-specified path.  How do
+>> traversals of absolute and relative paths differ?
+
+This is handled within the dir_open_by_name() function. This function first
+checks the 0th char of the path, to see if it's a "/" character.  If it is, it
+assumes the path is absolute; if not, it assumes the path is relative. Based
+on this, it sets up the variable "cur_dir" to point to the appropriate inital
+dir -- either the root directory, or the current working directory.  From this
+point on, the code is exactly the same for absolute and relative paths.
+
+After initializing cur_dir, we repeatedly do the following:
+a.  parse one token off of the path,
+b.  lookup that token in the "cur_dir"
+c.  step into the directory corresponding to that token, updating "cur_dir"
+
+The "skip_final_token" paramer specifies when this process terminates.
+
+If skip_final_token is false, we will treat the final token as a directory
+that should be traversed.  For example, this would be appropriate in a chdir("/path/to/existing/folder" command.
+
+If skip_final_token is true, we will skip over the final token and only desend
+into the directory for the second-to-last token.  For example, this would be
+appropriate in a create("path/to/new/file") command -- we wouldn't want to try
+to descend into the "file" subdirectory, particularly if "file" doesn't exist yet.
+
+In the first case, dir_open_by_name() will use the "dirp" argument to return
+by reference a struct dir corresponding to the final traversed directory .  In
+the second case, dir_open_by_name() will return the final token name in the
+"final_token_name" argument, and it'll return that token's parent directory in
+the "dirp" argument.
+
+
+---- SYNCHRONIZATION ----
+
+>> How do you prevent races on directory entries?  For example, only one
+>> of two simultaneous attempts to remove a single file should succeed,
+>> as should only one of two simultaneous attempts to create a file with
+>> the same name, and so on.
+
+This is all handled by the inode synchronization, below the level of the
+directory parsing. 
+
+>> Does your implementation allow a directory to be removed if it is in
+>> use as a process's current directory?  If so, what happens to that
+>> process's future file system operations?  If not, how do you prevent
+>> it?
+
+Yes, we allow directories to be removed if they're a process's current
+directory. It's up to the user to prevent this.
+
+The process will continue to be able to reference this directory, however,
+until its cwd is closed.  At this point, inode_close will detect that the last
+referencer to the directory's inode is done, and it will clean up the inode
+for the removed directory.
+
+---- RATIONALE ----
+
+>> Explain why you chose to represent the current directory of a process
+>> the way you did.
+
+We represent the current working directory as simply a dir *, because this
+seemed like the simplest solution.  With a dir * for the current working
+directory, we can do all of the things we'd need to do in that directory:
+list the entries, create a file, remove a file, open a file, change to a
+relative path (or absolute path, for that matter), etc.
+
+                 BUFFER CACHE
+                 ============
+
+---- DATA STRUCTURES ----
+
+>> Copy here the declaration of each new or changed `struct' or `struct'
+>> member, global or static variable, `typedef', or enumeration.
+>> Identify the purpose of each in 25 words or less.
+
+static struct hash cache_hash;
+We decided to use a hash map as our data structure to hold cache blocks.
+The key in the hash map is the disk_sector and the entry is the struct
+defined below.
+
+static struct lock cache_hash_lock;
+
+static bool flush_thread_alive;
+This boolean tells us if we already have a thread to flush the cache during
+write behind.  That way we don't have multiple simulatenous flush threads.
+
+
+static struct lock flush_thread_lock;
+
+static struct bitmap *prefetch_list;
+We use this list to keep track of blocks that are being evicted, but that
+other threads are currently using.  More about this in the synchronization
+section.
+
+static struct lock prefetch_list_lock;
+
+struct cache_hash_entry
+{
+  struct hash_elem h_elem; 
+  disk_sector_t sector; //hash_key
+  void *sector_data; //sector data
+  char sector_info; //tells us if it's metadata, number of accesses, and other info
+  struct lock sector_lock; //granular per sectior lock
+  int ref_count;
+};
+
+int INIT_NUM_ACCESSED;
+int ACCESSED_WEIGHT;
+int DIRTY_WEIGHT;
+int META_WEIGHT;
+
+static int MAX_SCORE;
+
+struct sector_to_evict 
+{
+  struct list_elem elem;
+  struct cache_hash_entry *evictee;
+};
+ 
+static struct list eviction_list; 
+static struct lock eviction_list_lock;
+
+/* this value makes sure that if we've removed something from the hash but have not
+ * free'd the memory, we won't try to add anything else to the cache */
+static int actual_maximum_entries = MAX_ENTRIES;
+
+
+
+---- ALGORITHMS ----
+
+>> Describe how your cache replacement algorithm chooses a cache block to
+>> evict.
+
+If the cache is full (i.e. contains 64 entries) at the time of caching
+in a block, we call the cache_out function.  The cache_out function iterates
+through our hash map (representing the cache) and checks the scores of each
+entry.  The score is determined by a weigthed sum of the following attributes
+and it is calculated in the evict_score function.  
+acc_score represents the number of recent accesses (read or write) to that
+disk sector multiplied by the ACCESSED_WEIGHT defined at the top of the file. 
+ 
+Every time we iterate through  the hash map to choose a best
+candidate we decrease the number of accesses by 1 for all entries.  We 
+considered changing this access-count decrease to an exponential decay
+but we quickly noticed that all entries went to 0 accesses very quickly
+and thus reducing granularity when choosing which blocks to evict. The number
+of accesses are stored in the first 6 bits of sector_info and hence we are able to
+count up to 64 accesses.
+
+dirty_score is simply 0 if the sector is clean or DIRTY_WEIGHT if the sector is 
+dirty.
+
+meta_score is 0 if the sector is just data or META_WEIGHT if the sector contains
+meta_data.
+
+At the end we sum these 3 scores and come up with a final score.  The entry
+with the LOWEST final score is the one we choose to evict.
+
+To determine the best weights for each of these scores we wrote a script.  The
+script passes in different weights as pintos arguments.  At the end of each
+run, the script gathers the number of cache misses and cache evictions.  Notice
+that in our implementation, cache misses != cache evictions.  For example, if
+we decide to write a full sector and that sector is not in the cache,
+then we do not fetch that block from disk before the write occurs. 
+Since there is no disk I/O in this case, we don't count that case as a miss.
+We also look at the time it took for the run to finish (which is indicative of
+how many disk_writes we did). If we are trying to evict fewer dirty blocks, for
+example, this won't affect our miss rate much but will make our system run faster.
+So we took all these factors into consideration when deciding which weights to use.
+
+After gathering data about cache misses and evictions, we chose the weights
+that minimize the average number of misses for all tests and used these for 
+our final submission. 
+
+>> Describe your implementation of write-behind.
+	As requested in the handout, we do not write blocks to the cache unless they
+are dirty and about to be evicted.  In cache_out, if a block is dirty and about to
+get kicked out, we put it in an "eviction_list".  The eviction list simply waits
+until other thread have finished modifying this entry before freeing the memory 
+(more about this under synchronization).
+	In addition to writing back on eviction, we also fork off a thread during each
+write to perform a cache flush after FLUSH_SLEEP_SECONDS. Whenever this thread
+is created, we set a boolean to make sure we don't create that thread twice.  When the
+thread dies, we set that boolean back to false.
+	The thread first sleeps and then calls filesys_flush_cache which takes care
+of writing all dirty sectors back to disk.
+ 
+>> Describe your implementation of read-ahead.
+  	As a parameter to the read function, we pass in the next sector to prefetch.  Since
+ we wouldn't like to block because of a prefetch, we fork off a separate thread to 
+ check if the block is already in the cache, and if not, read it from disk (evicting 
+ a block if necessary).  We make use of some of the same functions that are used to bring an
+ entry into the cache (please refer to prefetch_me in cache.c).
+ 	There are a few cases that we pass NO_READ_AHEAD to the cache.  This flag tells the 
+ cache not to fork off a thread to perform a prefetch.  Inode.c typically uses this flag
+ whenever it is reading metadata.  We found it unnecesary to prefetch any block while
+ reading metadata. 
+	
+
+---- SYNCHRONIZATION ----
+
+>> When one process is actively reading or writing data in a buffer cache
+>> block, how are other processes prevented from evicting that block?
+
+We allow other processes to evict that block, but the actual
+writing-to-disk portion of the eviction does not occur until all
+processes have finished writing to the block.  We do this using a
+reference count that is incremented whenever we start reading/writing
+the block's data, and decremented when we're done.
+
+>> During the eviction of a block from the cache, how are other processes
+>> prevented from attempting to access the block?
+They loop until the block has been evicted.  Then they can proceed.
+
+---- RATIONALE ----
+
+>> Describe a file workload likely to benefit from buffer caching, and
+>> workloads likely to benefit from read-ahead and write-behind.
+
+               SURVEY QUESTIONS
+               ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students in future quarters?
+
+>> Any other comments?
+

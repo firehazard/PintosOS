@@ -1,0 +1,92 @@
+So how is the disk aranged?
+
+BLOCK 0: root directory inode
+BLOCK 1-log2N: free list bitmap
+BLOCK log2N+1-N: available for files
+
+-----------------------------------------
+
+file inode structure - 512 bytes
+bytes 1 (1 bytes)
+ - in use - 1 bit for true (sanity checking?)
+ - is directory - 1 bit FALSE
+ - rest of bits unused
+ 
+bytes 2-440 (439 bytes)
+ - data (for efficiency with small files)
+
+bytes 441-444 (4 bytes)
+ - file size
+ 
+bytes 445-448 (4 bytes)
+ - inode magic
+
+bytes 449-496 (48 bytes)
+ - 12 direct links - if NULL, we assume these pages are filled with 0's
+
+bytes 497-508 (12 bytes)
+ - 3 indirect links
+
+bytes 509-512 (4 bytes)
+ - 1 doubly-indirect link
+
+----------------------------------------
+ 
+indirect link structure
+byte 1-512
+ - protection int = 0
+ - 127 direct links
+
+---------------------------------------- 
+ 
+doubly-indirect link structure
+byte 1-512
+ - protection int = 0
+ - 128 indirect links
+
+----------------------------------------
+ 
+directory inode structure-
+bytes 1
+ - in use - 1 bit for true (sanity checking?)
+ - is directory - 1 bit TRUE
+ - 2 bits unused
+ 
+byte 2-15 (14 bytes)
+ - directory name, 14 bytes long
+
+bytes 16-19 (4 bytes)
+ - # of files
+ 
+bytes 20-23 (4 bytes)
+ - inode magic
+ 
+byte 24-496 (473 bytes, that's 118 files)
+ - some way to store files in a hashed format. (i.e. use a hashing function to get the array index)
+ - initially, it can be a null-terminated list
+ - collisions: quadratic probing, or overflow area - or re-map all files with a new hash function
+ 
+bytes 497-508 (12 bytes)
+ - 3 indirect links
+
+bytes 509-512 (4 bytes)
+ - 1 doubly-indirect link
+
+---------------------------------------- 
+ 
+using them:
+
+ - directory inodes probably don't need to be stored in memory
+
+system-wide open file table:
+  hashmap based on disk inode address (or something)
+  on open, we find the disk inode and lookup in our hashmap. if it exists, we use this one (refcnt++)
+  on close, refcnt-- and if refcnt <= 0 we free the item
+  
+  each should contain the data within the inode, as well as refcnt
+
+------------------------------------------
+
+notes
+
+file inodes are allocated as they are needed (unlike unix which pre-allocates them). when you create a file, and tell it how big it needs to be, this many file blocks are requested, and set up with the inode. 

@@ -1,0 +1,694 @@
+             +--------------------------+
+             |          CS 140          |
+             | PROJECT 2: USER PROGRAMS |
+             |        DESIGN DOCUMENT   |
+             +--------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Daniel Holbert <dholbert@stanford.edu>
+Tom Deane <tdeate@stanford.edu>
+Tim Su <tim.su@stanford.edu>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, and lecture notes.
+
+Parts of the ring buffer use code 
+
+http://www.embedded.com/shared/printableArticle.jhtml?articleID=15300198
+
+               ARGUMENT PASSING
+               ================
+
+---- DATA STRUCTURES ----
+
+>> Copy here the declaration of each new or changed `struct' or `struct'
+>> member, global or static variable, `typedef', or enumeration.
+>> Identify the purpose of each in 25 words or less.
+
+We didn't create or change any structs, global variables, static
+variables, or enumerations while implementing argument-passing.
+
+---- ALGORITHMS ----
+
+>> Briefly describe how you implemented argument parsing.  How do you
+>> arrange for the elements of argv[] to be in the right order?  How do
+>> you avoid overflowing the stack page?
+
+First, before we tokenize the command string, we create our own copy
+of it in process_execute, to make sure it isn't too long. Then, in
+push_args_on_stack(), we tokenize the command string and push each
+tokenized argument onto the stack, in the order that they appear in
+the command string. Then, after word-aligning the esp and pushing on
+argv's null sentinel, we walk in the reverse direction across all of
+those pushed arguments, and we push each one's address on the stack.
+Due to this ordering, we'll end up with the 0th argument's address
+stored at the lowest position, the 1st argument's address at the
+next-lowest position, etc, as necessary for correct argv functioning.
+Then we push the argc value and the fake return value, completing our
+initial user stack.
+
+We avoid overflowing the stack page in two ways:
+ a) When we create our copy of the command string in process_execute,
+we make sure that it is at most PGSIZE-2 in length (and we end the
+process if it's longer).  This ensures that we won't overflow a page
+while we're pushing the tokenized arguments onto the stack.
+ b) After we've pushed the tokenized arguments onto the page, we
+calculate we calculate "final_esp" before pushing anything else on the
+stack.  "Final_esp" represents the future value of esp after we've
+finished setting up the stack.  We check if "final_esp" is beyond the
+page boundary, and if so, we end the process.  If not, we can proceed
+safely because we know we have space on the stack for the remaining
+stack-setup data.
+
+Note: We set the maximum command string length to be PGSIZE-2 because,
+given that we copy the command string into a buffer of size PGSIZE,
+PGSIZE-2 is the largest value that strlcpy could return (when filling
+this buffer) that would indicate a reasonable-sized original string.
+A return value of PGSIZE-1, on the other hand, would only indicate
+that the original string was *at least* PGSIZE-1 bytes long and that
+we copied the first PGSIZE-1 bytes because that's the most we can
+store.
+
+---- RATIONALE ----
+
+>> Why does Pintos implement strtok_r() but not strtok()?
+
+strtok_r is thread-safe, and pintos needs to be designed to be thread-safe.
+The reason strtok_r is thread-safe is that it is reentrant; in other
+words, it uses the additional argument save_ptr to save state, rather
+than maintaining its own private (and thread-unsafe) state, as
+strtok() must do.
+
+>> In Pintos, the kernel separates commands into a executable name and
+>> arguments.  In Unix-like systems, the shell does this separation.
+>> Identify at least two advantages of the Unix approach.
+
+The Unix approach is better because
+a) Having arguments parsed in the shell makes it easier to extend.  
+   If, for example, designers decide to add support for tab-completion
+   in shell commands, this is easier if the shell already includes
+   functionality to deal with a command's arguments one-by-one.
+ 
+b) If something goes wrong, the whole kernel could die under the pintos
+   approach. It's much safer to abstract the shell to user code.
+   In general, this makes the operating system more robust: even if
+   the shell dies, the kernel can re-create it, if desired, and the 
+   system can continue running.
+
+                 SYSTEM CALLS
+                 ============
+
+---- DATA STRUCTURES ----
+
+>> Copy here the declaration of each new or changed `struct' or `struct'
+>> member, global or static variable, `typedef', or enumeration.
+>> Identify the purpose of each in 25 words or less.
+
+The purpose of this monster struct is to keep data on each process for more
+efficient management: for example, finding all of a process's children.
+
+/* Data structure for keeping vital process data */
+struct process
+{
+  tid_t main_tid;            /* My main thread tid (for process_wait) 
+                                (Right now, only one thread per user process
+                                 is supported, so this is actually this
+                                 process's *only* tid) */
+  char* command_line;        /* The command line used to create me */
+  struct list children;      /* Children I have created */
+  struct list_elem elem;     /* List element. */    
+  struct thread* parent;     /* The parent thread */
+  int exitcode;              /* The exit-code that this returns */
+  int status;                /* Status flags. */
+  
+  struct file *exec_file;
+  
+  /* Fields dealing with my opened files */
+  struct file **files;          /* Array of file*'s for my files */
+  unsigned int allocated_size;  /* Max # of file*'s that I can hold
+                                   without reallocating */
+  unsigned int logical_size;    /* Number of file* slots that have
+                                   been used at least once */
+  struct ring_buffer unused_indices; /* Array of the indices within
+                                        the "files" array that we aren't
+                                        currently using. */
+};
+
+The purpose of the ring buffer is to keep track of which file descriptors
+have been freed up and can be allocated to a new file.
+
+struct ring_buffer
+{
+  unsigned int *buffer;
+  unsigned int head, tail, size;
+};
+
+The following ivar is added to the thread struct to keep track of the
+process that owns the thread.
+
+    void* parent_process;     /* Ptr to the owner process of this thread */
+
+There are also new global variables
+
+/* the process of the initial thread. it's on the stack and not malloc'd */
+static struct process initial_process;
+
+/* this lock is for making sure filesys operations are atomic. */
+struct lock filesys_lock;
+
+/* this lock is for making sure certain parts of process_exit are atomic. */
+struct lock process_exit_lock;
+
+>> Describe how file descriptors are associated with open files.  Are
+>> file descriptors unique within the entire OS or just within a single
+>> process?
+
+File descriptors are unique within a given process, but not within the
+entire OS.  Each process keeps its own array of struct file*'s for the
+files that it has open.  We define the file descriptor to be the index
+of the corresponding file* within this array, plus 2 to allow for the
+STDOUT and STDIN fd's. 
+
+When a user closes a file, process_pop_file() will clear the
+corresponding "files" entry and push its index onto the
+"unused_indices" ringbuffer, indicating that this index is now
+available. 
+
+When a user opens a file, process_store_file() does the work of
+assigning it an index within the "files" array.  It first checks if
+the ring-buffer has any unused indices stored, and if so, it will
+assign the first one of those to the newly opened file.  If the
+ring-buffer is empty, process_store_file() simply assigns the file to
+the next untouched element of our "files" array (which is given by
+"logical_size" within the struct process).  However, if the the
+"files" array is full (i.e. if logical_size == allocated_size), we
+have to dynamically allocate more memory before we can write the new
+file to its correct position in "files".
+
+---- ALGORITHMS ----
+
+>> Describe your code for copying data from user programs into the kernel
+>> and vice versa.
+First we define what's a valid user address.
+A user address is valid when the following conditions are met:
+ 1.) The address must not be NULL
+ 2.) The address must reside below PHYS_BASE
+ 3.) The address must be user mapped (allocated).
+
+There are two types of data we need to copy from user to kernel: ints and 
+c-strings.
+
+For ints, copying is very simple.  We first check that the user vaddr is 
+valid and then we copy the int val to our own stack. Pseudocode example:
+Check Addr(usr_int_addr);
+int num = *usr_int_addr;
+
+Copying a string is trickier.  We first check that the beginning of the string
+resides in a valid address.  If so, then we call get_page to make sure that the
+user has allocated the page where the first char resides.  We then determine
+how much room left is in that page for user data. We start counting the number
+of characters in the string checking for the end-of-char.  As soon as we find 
+it, we break out of the counting loop and copy the string.  If we reach the end
+of the page and we have not yet found the end of the string, then we assume 
+the user string continues on the next page.  Hence, we call get_page again to
+get the next user page. If get_page doesn't return null, then we know the user
+has allocated the page and we continue checking for the end-of-char.  We 
+continue this process until we find end-of-char or until we detect an invalid
+address.  At this point, an invalid address can occur for two reasons:
+1.) we go to the next page and realize the user has no allocated that memory, 
+or 2.) we have gone over PHYS_BASE and without finding the end-of-char.
+
+To illustrate this point, let's go through an example:
+
+Assume the user passes us address 0x4080 as the starting point of a string.
+We don't know the length of the string at this point, but for the sake of 
+this example let's assume it's 30 characters long.
+1.) We first check user address 0x4080:
+        a.) Is it null? If not, keep going, otherwise kill process.
+        b.) Is it above PHYS_BASE? If not, keep going, otherwise kill process.
+        c.) Call get page on 0x4080. Does it return null? If not, user
+            has allocated the page and we keep going, otherwise we kill process
+        d.) Find out how much room we have left on this page: 0x4096-0x4080 = 16.
+        e.) We start looking for the end-of-char for 0x16=20 bytes.  We reach
+                the end of the page and we haven't found the end of char.
+        f.) Now our iter pointer points to 0x4097. Repeat steps b through d.
+        g.) We realize that after 10 characters we find the end-of-char and
+                hence we copy the entire string to kernel space.
+   
+
+>> Suppose a system call causes a full page (4,096 bytes) of data to be
+>> copied from user space into the kernel.  What is the least and the
+>> greatest possible number of inspections of the page table (e.g. calls
+>> to pagedir_get_page()) that might result?  What about for a system
+>> call that only copies 2 bytes of data?  Is there room for improvement
+>> in these numbers, and how much?
+
+  In the case of an entire page, the min number of inspections of the 
+page table is 3:
+ -  1 to get the syscall number, 
+ -  1 to check the arguments' addresses
+ -  1 to check the validity of the range. 
+This situation would happen if the source page address is page-aligned.
+
+  The max number of inspections of the page table is 5: 
+ - 1 to check the syscall number 
+ - 2 to check the arguments' addresses (e.g. the stack pointer is near
+a page boundary)
+ - 2 to check the address range whenever the 4096 bytes span 2 pages.
+
+  The minimum and maximum number of inspections are the same for 2
+bytes.  The only difference is that we'll be much more likely to have
+fewer inspections in the 2-byte case -- the maximum case could only
+occur if the two bytes split a page-boundary, which isn't very likely.
+
+  Is the room for improvement? Of course.  Theoretically, we could
+reduce the number of checks to 1 check in best case scenario and 2 in
+the worst case.  This is what we could do: 
+  First, we would add a bit to every PTE that tells us whether the next
+page is user allocated (call it the "next-page bit").  When we check
+the validity of the syscall number's address, we'd also check the next
+12 bytes (to cover all potential arguments) and the next-page bit of
+that page.  The bit would be '1' in case the arguments go across
+multiple pages.  On top of that we check to see if the user pointer
+(that points to the 2 bytes or 4096 bytes in this case) happens to
+start in the same page as the arguments' page.  In the 2 bytes case,
+this is a possibility and we would be able to do all the checks with
+just one pagedir_get_page call.  In the 4096 case, if the next-page is
+'1' and the data starts in the same page as the arguments, then once
+again, we were able to complete all the checks in 1 page .  The wost
+case scenario simply occurs when the data does not live in the same
+page as the arguments.
+
+However, while this optimization does offer an improvement to these
+cases, the average-case speedup from this optimization does not
+merit the complexity and the work that it would take to implement.
+
+>> Briefly describe your implementation of the "wait" system call and how
+>> it interacts with process termination.
+
+    Each process struct has a status int that can simultaneously store
+    several different boolean values (via bitmasking). 
+    
+    When the parent calls wait() on a child:
+      If the child has already exited (status contains THREAD_STATUS_DEAD),
+        wait() will instantly return the exit code.
+      If the child is alive, wait() sets THREAD_STATUS_WAITING in the
+        child's status field, and then it blocks the calling
+        thread. When it resumes execution, it frees the child's
+        process struct and returns the exit code.
+      If the child could not be found, wait() returns TID_ERROR
+
+    Whenever a process exits, one of these things happens:    
+      If the parent has already exited, the child frees its own process struct
+      If the parent is still alive, the child keeps its struct, and it
+        sets its THREAD_STATUS_DEAD status bit. This way, if the
+        parent decides to wait on this thread, the struct (and thus
+        the exitcode) will be available. 
+      If the parent is still alive and the child has THREAD_STATUS_WAITING, 
+        the child unblocks the parent and lets the parent take care of
+        business. 
+          
+    Also, every time a process exits, it notifies its children that
+    their parent has finished. This is to make sure that the children will
+    free their own memory in this case.
+
+>> Any access to user program memory at a user-specified address can fail
+>> due to a bad pointer value.  Such accesses must cause the process to
+>> be terminated.  System calls are fraught with such accesses, e.g. a
+>> "write" system call requires reading the system call number from the
+>> user stack, then each of the call's three arguments, then an arbitrary
+>> amount of user memory, and any of these can fail at any point.  This
+>> poses a design and error-handling problem: how do you best avoid
+>> obscuring the primary function of code in a morass of error-handling?
+>> Furthermore, when an error is detected, how do you ensure that all
+>> temporarily allocated resources (locks, buffers, etc.) are freed?  In
+>> a few paragraphs, describe the strategy or strategies you adopted for
+>> managing these issues.  Give an example.
+
+Regarding error handling strategy:
+
+We handle errors cleanly is through decomposition and wrappers.  For
+example, we have a single function that retrieves a FD and kills the
+process if it fails, and a few functions that check if user memory is
+valid and also makes a copy of what it points to. This makes the code
+more clean and easy to read, and abstracts the error handling
+away. However, one downside is that error handling functions do
+multiple things and need to be thoroughly understood before being
+used.
+        
+Example: User makes a syscall_write:
+
+We first need to check that the syscall number is in a valid address
+range.  Then we need to check that all the 3 arguments are in a valid
+address range.  This can be done with a single function that checks
+the range for validity before we even make the specific system call.
+If anything seems out of place, that function itself will take care of
+killing the process.  When the actual write() function is called in
+syscall.c, the arguments will have already been checked (so in this
+way, we hide some of the error checking). However, the write function
+also needs to make sure that the buffer has been allocated.  Again,
+this can be done with a single function call that will do all the
+error checking. This prevents the write() function itself from being polluted
+with all of the error-checking functionality.
+
+Finally, to go from file descriptor (int) to struct file*, there is a 
+function fd_to_file_intolerant that is used to do this conversion. It
+is used as such in file_write for example:
+        
+        f = fd_to_file_intolerant(fd);
+           
+            /* Found the file.  Write to it. */
+            return file_write_sync(f, buffer, size);
+            
+What this function does is wrap process_get_file with some error handling
+code if the struct file* is null (by error handling i mean it kills
+the thread). All of this is abstracted from the person who uses this 
+function; the end programmer can rest assured that f will be vaild
+in the file_write_sync call (or else the process would have exit).
+
+Regarding freeing resources:
+Any thread that is killed will go through process_exit, which is our
+ubiquitous free-resource function. This function takes care of freeing
+the command line string, the file and unused fd lists, closing any
+open files, and releasing the file sync lock if it is held. The other
+malloc'd piece of information, the actual process struct, is usually freed
+by the process's parent (see the waiting section).
+        
+The only case this doesn't apply is for the initial process (the only thing
+the initial process is good for is waiting for its child). The initial
+process doesn't really allocate anything (it doesn't need to open any files
+or have a command line, and its process struct is in the stack), so it doesn't
+need to free anything.
+
+---- SYNCHRONIZATION ----
+
+>> The "exec" system call returns -1 if loading the new executable fails,
+>> so it cannot return before the new executable has completed loading.
+>> How does your code ensure this?  How is the load success/failure
+>> status passed back to the thread that calls "exec"?
+
+The main thread calls create_thread and then, if the child isn't done
+loading, blocks.  The newly spawned process tries to load the
+executable and gets a "bool success". It then sets a flag in it's own
+process struct describing the status of the load, and unblocks the
+parent if relevant. The parent can then read from this value and
+figure out whether the load was a success or failure. The process
+struct allocated for this failed load is then freed up by the parent
+if the load failed.
+    
+There is a potential race condition here: child process writes to its
+status while the parent reads from it. This is prevented in the
+following way:  
+  1. Parent creates the child, and sleeps (atomic operation)
+  2. The child tries to load the executable. Regardless of the result,
+it waits for the parent to sleep. If the parent isn't asleep, the
+child yields. Since sleeping is an atomic operation (interrupts are
+disabled), there are no race conditions involved with this
+interaction.
+  3. The child then sets up its status (while the parent is still
+blocked). It is the only one that will be reading/writing its status
+bit.
+  4. The child then unblocks the parent and doesn't touch the status
+bit. The parent now is the only one that will be reading from the
+status bit.
+
+>> Consider parent process P with child process C.  How do you ensure
+>> proper synchronization and avoid race conditions when P calls wait(C)
+>> before C exits?  After C exits?  How do you ensure that all resources
+>> are freed in each case?  How about when P terminates without waiting,
+>> before C exits?  After C exits?  Are there any special cases?
+
+    When P calls wait(C) before C exits:
+        
+        If C is dying as this occurs, there could be synchronization problems
+        because the code first checks to see if C is dead, and if not, calls
+        thread_block. If the thread dies in between then, the parent will
+        be blocked forever. So, the checking if C is dead and blocking
+        is wrapped by intr_disable so it happens atomically. Disabling
+        interrupts is okay here because they need to be disabled
+        anyways to call thread_block, we are just disabling them a few
+        lines of code earlier.
+    
+    When P calls wait(C) after C exits:
+    
+        C's status will have the THREAD_STATUS_DEAD flag set, so
+        P will know not to block. Instead, it will just read the exit code
+        and free C's process struct.
+        
+        There aren't any race conditions, since C only has one parent, and
+        the parent is the only one that can free C besides C, which is dead.
+        
+    In both these cases, a critical data structure is P's children list.
+    P is the only one who modifies children or reads from children
+    (this happens during process_wait and process_execute). Therefore
+    there are no
+    sync problems with the children list.
+    
+    Also, in both of these cases where P waits on C, P is responsible
+    for freeing C's process struct. In general, the parent is
+    responsible for freeing the child's process struct, unless the
+    parent exits first, as we'll see.
+    
+    If P exits before C exits:
+    
+        P will set a special flag in C's status field that tells it that
+        the parent is dead (THREAD_STATUS_PARENT_DIED). This lets C
+        know that it is now responsible for freeing its own memory. When
+        C exits, (because there will no longer be a potential parent that
+        will wait on it), C will free its own process struct.
+        
+    In general, when a process exits, it lets all of its children know
+    that it is dead, and that they need to free their own memory. This is
+    the only case where the children free their own memory.
+        
+    In the case that the parent and child die at the same time, there is a
+    potential for bad interleaving:
+        
+    1   if(this_process->status & THREAD_STATUS_PARENT_DIED)
+    2     free(this_process);
+    3   else
+    4   {      
+    5     this_process->status |= THREAD_STATUS_DEAD;
+          
+    If before line 5, the parent dies, the parent will not know that the child
+    is dying, so it will set the child's THREAD_STATUS_PARENT_DIED, and assume
+    the child will take care of things. However, this is after the child has
+    checked its own flag, so the child will assume that the parent will take
+    care of the memory. Thus, we have put a lock over a significant portion of
+    the process_exit code to make sure that memory is always freed.
+    
+If P exits after C exits:
+    
+ P will loop through its children and free all of the children that have
+ already died (status & THREAD_STATUS_DEAD). Since the child is dead and
+ cannot modify its status, there are no race conditions here. The parent
+ frees any children that have died.
+          
+Edge cases other than the ones mentioned are:
+        
+If two children simultaneously exit, things should be okay. For the
+most part, children will not modify parent structs (unless the parent
+is waiting for the children, which can only happen one-at-a-time), so
+children modifying their own structs should not be a problem.
+        
+If the parent tries to wait on a failed-load child, things are also okay.
+Technically, this can't occur because if the load failed, the parent isn't
+unblocked until the child thread is totally done. This is to avoid race
+conditions where the child is reading from its process struct while the
+parent is freeing its process struct, or when the parent tries to iterate
+through its children, and one of them is is a failed load.
+
+If the parent has just created a child and is waiting to see whether the
+load was successful (and it is blocked), and one of its other children
+dies, there will be no race because the child that dies does not modify
+any data for its siblings or parent. 
+
+If a child is creating a grandchild and its parent dies, there will also
+not be a race condition because the parent will modify the child's status
+bit (to set THREAD_STATUS_PARENT_DIED), but the child does not read/write its
+own status bit (only its child's) when it is creating a grandchild.
+
+If a parent thread creates a child, and right after it finished creating
+the child it was killed unexpectedly, there is a possible race condition:
+The child thread checks if the parent struct is valid, then proceeds to
+use the parent struct to decide if the parent is waiting for it. However,
+if the parent died in between this code, the parent struct might no longer
+be valid. Usually, the parent starts blocking so there is no race condition,
+but if the parent is killed before it is able to start blocking, there 
+could be trouble.
+
+To combat this, we have to split up the check for the parent != NULL and use
+the process_exit lock to prevent processes from exiting during this time:
+
+  /* report to the parent whether the loading was success or fail */   
+  
+          while(true)
+          {
+            lock_acquire(&process_exit_lock);
+            /* make sure the parent can't exit when we do this check */
+    if(this_process->parent == NULL)
+    {
+        this_process->status |= THREAD_STATUS_PARENT_DIED;
+        break;
+    }        
+    if(this_process->parent->status == THREAD_BLOCKED)
+        break;
+    lock_release(&process_exit_lock);
+
+    /* if the child thread started executing before the parent
+     * thread blocked, spin (see end of process_execute()) */
+    thread_yield();
+  }
+  
+  ...
+  
+  lock_release(&process_exit_lock);
+  
+As is shown, we aquire the lock, check if the parent has exit (and if not
+whether the parent is blocking), and then release the lock. Otherwise,
+bad interleaving could occur if we check if parent != NULL, the parent dies
+then we check if parent status == BLOCKED. Our solution is a little more complelx
+than this, but to save space it isn't all included here. The lock protects
+a small section of code where we read from our status, and we need to protect
+that from an exiting parent as well.
+
+---- RATIONALE ----
+
+>> Why did you choose to implement user-to-kernel copying the way you
+>> did?
+
+The first thing we do on a syscall is copy the syscall number.  We
+can't do anything without the syscall number so this is done right away.
+With the sycall number in hand, and having checked all argument addresses
+for validity, we go into the syscall_wrapper function that determines
+which specific syscall is to  be invoked.  At this point, argument copying
+actually takes place in the function call.  We know that at this point the
+addresses must be valid so copying the integer or ptrs is simply a matter of 
+derefencing that address. For example, when we discover the user wants
+to make the syscall "write", we call:
+       write(*(int *)arg0,*(const void **)arg1,*(unsigned *)arg2);
+
+In this case, the caller is copying all arguments into it's stack; that
+is, two integers and one pointer.  We don't know if the pointer points to
+somewhere valid, but at least we know that the pointer resides in a valid
+address so it is safe to copy it here.
+We don't do this argument copying earlier simply because we don't know
+which syscall will take place.  We don't do it later because we dont believe
+the syscall function should have to worry about it.
+
+Nonetheless, to keep the abstraction consistent, those functions that
+take in a string need to do the string copying themselves.  We felt that
+having the previous function also take care of the copying of that string
+would clutter it up and perhaps break the abstraction. However, we 
+provide a very easy-to-use function for string copying:
+       static char * user_kernel_strcpy (const char *string)    
+
+The inner workings of this function are explain at the beginning of
+this document, but all we need to know here is that sycalls that make use
+of a user string must simply call this function to create a copy.          
+        
+>> What advantages or disadvantages can you see to your design for file
+>> descriptors?
+
+First, we are going for speed. File-id lookup is very fast with our
+system, it's just indexing an array (with bounds checking por
+supuesto). Opening a file is also very fast, it's just popping the
+next unused file-id from a ring-buffer (i.e. eading a value and ++ a
+pointer). If we open too many files, we have to use malloc to increase
+our buffer size. This brings us to our next point:
+
+To get more speed, we tried to minimize memory-allocations. Malloc
+generally takes a long time to execute (hundreds of instructions), so
+we try to minimize by:
+  1. Reusing file id's of files that have been closed. The downside to
+this is that if the user has a bug where they write to a file that has
+been closed and another file is opened with that file-id, they may
+have no idea this happened.  To re-use the file descriptors, we have a
+buffer of unused indices from our files array. (which correspond to
+file descriptors)
+  2. Although we start the file table out pretty small (to save memory,
+assuming most programs don't open many files), we grow it
+exponentially (making the assumption that if a user opens many files,
+there is a good chance they will want to open even more files).
+  3. We use a table instead of a linked list. We could have malloc'd a
+struct every time the user opens a file, but this would result in one
+malloc every file_open and O(n) walking through the list every file
+access.
+           
+We also tried to minimize the time it takes to open a new file, trying
+to get O(1) and not O(n). The best way to get O(1) time, though, is to
+not re-use file-id's and keep growing the file table (so we never have
+to worry about finding an unused file-id, we keep adding them to the
+end). However, we wanted to minimize malloc's since a malloc is
+probably much more expensive than traversing the list to find an
+unused file-id for typical list sizes. Thus, we balanced both needs by
+keeping a buffer of unused file-id's so as long as the buffer isn't
+empty we can just pop an unused file-id from the buffer.
+    
+We had to make tradeoff's in the buffer design as well: another option
+for the buffer would be a linked list of unused file-id's which would
+save memory (we only have what we need), but would result in even more
+malloc's. Thus, we decided to use a ringbuffer of a fixed size (the
+size of the file table). This uses a wee bit more memory but saves
+lots of instructions because we malloc much less frequently.
+    
+The disadvantage to this is we have a lot of unused memory and
+therefore internal fragementation. We have two tables: a file-id
+lookup table and a unused file-id buffer, and both are usually not
+going to be 100% utilized most of the time (if they were, and the user
+opened one more file, they would double in size, and then they would
+be 50% utilized).  This is the tradeoff we make for having less
+malloc's and a speedy lookup to find unused file-id's.
+    
+The reason we didn't choose to make a global FD list is because if we
+did this, we would have to record the file owner process along with
+the file pointer, which is added overhead (it would require a third
+list that stores the owner process, along with the ringbuffer list and
+the struct file* list). It is not clear whether there would be more or
+less internal fragmentation with a global file list (with a bigger
+list, there is more likelyhood of unused entries since the list grows
+exponentially), so we went with the option with less overhead.
+    
+
+>> The default tid_t to pid_t mapping is the identity mapping.  If you
+>> changed it, what advantages are there to your approach?
+
+We did not change this approach. The normal approach will ensure
+by itself that pid's are unique in the system and that they are
+not pointers, so users cannot try to screw things up. Rather,
+we build our system around this feature by incorporating tid into
+the process struct, so users can find a process given a tid and the
+fact that the current process created the process.
+
+               SURVEY QUESTIONS
+               ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students, either for future quarters or the remaining projects?
+
+>> Any other comments?

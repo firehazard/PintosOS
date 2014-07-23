@@ -1,0 +1,16 @@
+Pintos booting with 4,096 kB RAM...
+Kernel command line: -f -q put lg-seq-block run lg-seq-block
+372 pages available in kernel pool.
+371 pages available in user pool.
+Calibrating timer...  102,400 loops/s.
+hd0:0: detected 1,008 sector (504 kB) disk, model "Generic 1234", serial ""
+hd0:1: detected 4,032 sector (1 MB) disk, model "Generic 1234", serial ""
+hd1:0: detected 1,008 sector (504 kB) disk, model "Generic 1234", serial ""
+Formatting filesystem...done.
+Boot complete.
+Putting 'lg-seq-block' into the file system...
+Executing 'lg-seq-block':
+(lg-seq-block) begin
+(lg-seq-block) create "noodle"
+(lg-seq-block) open "noodle"
+(lg-seq-block) writing "noodle"

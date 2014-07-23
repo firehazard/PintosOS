@@ -1,0 +1,2 @@
+FAIL
+Didn't shut down properly: no "Timer: # ticks" shutdown message
